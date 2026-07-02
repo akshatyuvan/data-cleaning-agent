@@ -1,31 +1,28 @@
 """
-main.py  —  Builds and runs the LangGraph agent graph.
+main.py  --  Builds and runs the LangGraph agent graph.
 
-LANGGRAPH CONCEPTS USED HERE:
-------------------------------
-StateGraph:
-  - The graph object. You add nodes and edges to it, then compile it.
-  - Compiled graph is what you actually invoke.
+UPDATED FOR: 4 new preprocessing agents + shared Critic + Orchestrator routing.
 
-add_node(name, function):
-  - Registers a node. The function signature must be: fn(state: AgentState) -> dict
+GRAPH FLOW (current):
+  START -> profiler -> orchestrator_router -> {cleaner | encoder | scaler |
+                                                imbalance_handler |
+                                                feature_selector | analyst}
+                              ^                         |
+                              |                         v
+                       (loop back here            each agent -> critic
+                        after each agent                |
+                        completes a step)         critic_router
+                                                    /          \
+                                              accept            reject
+                                                |                  |
+                                    back to orchestrator    back to SAME
+                                    (picks next step)        agent (redo)
 
-add_edge(from, to):
-  - Hard/unconditional edge. Always goes from -> to.
-
-add_conditional_edges(from, router_fn, mapping):
-  - After `from` node runs, calls router_fn(state) to get a string key.
-  - Looks up that key in `mapping` to find the next node name.
-  - THIS is the mechanism that makes the Critic's redo loop real.
-
-START / END:
-  - Special sentinel nodes from LangGraph. Graph begins at START, terminates at END.
-
-GRAPH FLOW (Day 1 placeholder):
-  START -> profiler -> cleaner -> critic --[accept]--> analyst -> END
-                          ^                |
-                          |___[reject]_____|
-                          (redo loop, up to max_rounds times)
+KEY DESIGN: critic is ONE shared node. After it runs, critic_router decides
+accept/reject. On accept, control returns to orchestrator_router, which
+decides the NEXT step (not analyst directly -- only goes to analyst once
+all requested steps are done). On reject, control goes back to whichever
+agent just ran, for a redo.
 """
 
 from langgraph.graph import StateGraph, START, END
@@ -33,47 +30,71 @@ from langgraph.graph import StateGraph, START, END
 from state.schema import AgentState, make_initial_state
 from agents.profiler import profiler_node
 from agents.cleaner import cleaner_node
+from agents.encoder import encoder_node
+from agents.scaler import scaler_node
+from agents.imbalance_handler import imbalance_handler_node
+from agents.feature_selector import feature_selector_node
 from agents.critic import critic_node
 from agents.analyst import analyst_node
 
 
 # ---------------------------------------------------------
-# ROUTER FUNCTION  —  this is what makes it truly agentic
+# ROUTER FUNCTIONS
 # ---------------------------------------------------------
+
+def orchestrator_router(state: AgentState) -> str:
+    """
+    Decides which preprocessing agent runs next based on requested_steps,
+    auto-including dependencies, and skipping unrequested steps entirely.
+
+    Called in TWO places in the graph:
+    1. Right after the Profiler (to pick the FIRST step)
+    2. After the Critic accepts a step (to pick the NEXT step)
+    Same function, same logic, because "what's the next undone requested
+    step" is identical in both cases.
+    """
+    steps = state["input"]["requested_steps"]
+    pipeline_steps_run = state["metadata"]["pipeline_steps_run"]
+
+    # Dependency rule: encoding/scaling/feature_selection need cleaning first
+    needs_cleaning = steps["encoding"] or steps["scaling"] or steps["feature_selection"]
+    if needs_cleaning and not steps["cleaning"] and "cleaner" not in pipeline_steps_run:
+        return "go_to_cleaner"  # auto-included; trace note happens inside cleaner_node
+
+    if steps["cleaning"] and "cleaner" not in pipeline_steps_run:
+        return "go_to_cleaner"
+    if steps["encoding"] and "encoder" not in pipeline_steps_run:
+        return "go_to_encoder"
+    if steps["scaling"] and "scaler" not in pipeline_steps_run:
+        return "go_to_scaler"
+    if steps["imbalance_handling"] and "imbalance_handler" not in pipeline_steps_run:
+        return "go_to_imbalance_handler"
+    if steps["feature_selection"] and "feature_selector" not in pipeline_steps_run:
+        return "go_to_feature_selector"
+
+    return "go_to_analyst"  # all requested steps done
+
 
 def critic_router(state: AgentState) -> str:
     """
-    Called by LangGraph after the Critic node runs.
-    Returns a string key that maps to the next node.
+    Called after the Critic node runs.
 
-    Why this is important for interviews:
-    - This is NOT an if/else in the Critic node itself.
-    - LangGraph evaluates this function AFTER the node returns.
-    - The graph topology itself is dynamic -- the path through the graph
-      is determined at runtime based on state, not hardcoded at build time.
-    - This is the definition of a real conditional edge.
+    accept / max-rounds-exceeded -> go back to orchestrator (picks next step)
+    reject                       -> go back to the SAME agent that just ran
     """
     verdict = state["critic"]["current_verdict"]
+    active_agent = state["metadata"]["current_active_agent"]
     total_rounds = state["critic"]["total_rounds"]
     max_rounds = state["critic"]["max_rounds"]
 
     if verdict is None:
-        # Should never happen, but fail safe
-        print("[Router] WARNING: No verdict found, defaulting to analyst")
-        return "go_to_analyst"
+        return "go_to_orchestrator"
 
-    if verdict["verdict"] == "accept":
-        print(f"[Router] Critic accepted after {total_rounds} round(s). Moving to Analyst.")
-        return "go_to_analyst"
+    if verdict["verdict"] == "accept" or total_rounds >= max_rounds:
+        return "go_to_orchestrator"
 
-    if total_rounds >= max_rounds:
-        # Safety valve: don't loop forever
-        print(f"[Router] Max rounds ({max_rounds}) reached. Forcing analyst with caveats.")
-        return "go_to_analyst"
-
-    # Critic rejected -- send back to Cleaner for another round
-    print(f"[Router] Critic rejected. Sending back to Cleaner (round {total_rounds + 1}).")
-    return "go_to_cleaner"
+    # Reject -> route back to whichever agent just ran, by name
+    return f"redo_{active_agent}"
 
 
 # ---------------------------------------------------------
@@ -83,32 +104,68 @@ def critic_router(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     """
     Constructs the agent graph. Returns the compiled graph ready to invoke.
-
-    Separation note: build_graph() only wires structure.
-    Node logic lives in agents/*.py.
-    State schema lives in state/schema.py.
-    This function is pure plumbing.
     """
     graph = StateGraph(AgentState)
 
-    # Register nodes
+    # Register all nodes
     graph.add_node("profiler", profiler_node)
     graph.add_node("cleaner", cleaner_node)
+    graph.add_node("encoder", encoder_node)
+    graph.add_node("scaler", scaler_node)
+    graph.add_node("imbalance_handler", imbalance_handler_node)
+    graph.add_node("feature_selector", feature_selector_node)
     graph.add_node("critic", critic_node)
     graph.add_node("analyst", analyst_node)
 
-    # Unconditional edges
-    graph.add_edge(START, "profiler")       # graph always starts at profiler
-    graph.add_edge("profiler", "cleaner")   # profiler always hands off to cleaner
-    graph.add_edge("cleaner", "critic")     # cleaner always hands off to critic
+    # Start -> Profiler always runs first
+    graph.add_edge(START, "profiler")
 
-    # THE CONDITIONAL EDGE  (the core agentic mechanism)
+    # Profiler -> Orchestrator decides the FIRST preprocessing step
     graph.add_conditional_edges(
-        "critic",           # after this node runs...
-        critic_router,      # ...call this function to get a routing key...
-        {                   # ...and map the key to the next node
-            "go_to_analyst": "analyst",
+        "profiler",
+        orchestrator_router,
+        {
             "go_to_cleaner": "cleaner",
+            "go_to_encoder": "encoder",
+            "go_to_scaler": "scaler",
+            "go_to_imbalance_handler": "imbalance_handler",
+            "go_to_feature_selector": "feature_selector",
+            "go_to_analyst": "analyst",  # edge case: zero steps requested
+        }
+    )
+
+    # Every preprocessing agent hands off to the SAME shared critic
+    for agent_name in ["cleaner", "encoder", "scaler", "imbalance_handler", "feature_selector"]:
+        graph.add_edge(agent_name, "critic")
+
+    # Critic's verdict decides: redo same agent, or go back to orchestrator
+    graph.add_conditional_edges(
+        "critic",
+        critic_router,
+        {
+            "go_to_orchestrator": "orchestrator_proxy",  # see note below
+            "redo_cleaner": "cleaner",
+            "redo_encoder": "encoder",
+            "redo_scaler": "scaler",
+            "redo_imbalance_handler": "imbalance_handler",
+            "redo_feature_selector": "feature_selector",
+        }
+    )
+
+    # NOTE: LangGraph conditional_edges need a NODE name on the right side,
+    # not a router function directly. So "go back to orchestrator" needs a
+    # tiny pass-through node that just re-runs the SAME routing decision.
+    graph.add_node("orchestrator_proxy", lambda state: {})  # no-op, just a hop
+    graph.add_conditional_edges(
+        "orchestrator_proxy",
+        orchestrator_router,
+        {
+            "go_to_cleaner": "cleaner",
+            "go_to_encoder": "encoder",
+            "go_to_scaler": "scaler",
+            "go_to_imbalance_handler": "imbalance_handler",
+            "go_to_feature_selector": "feature_selector",
+            "go_to_analyst": "analyst",
         }
     )
 
@@ -126,17 +183,15 @@ def run_pipeline(
     dataset_path: str,
     dataset_name: str = "my_dataset",
     target_column: str | None = None,
+    requested_steps: dict | None = None,
 ) -> AgentState:
-    """
-    Main entry point. Build the graph, run it, return final state.
-    FastAPI will call this (Day 8+). For now, run directly.
-    """
     graph = build_graph()
 
     initial_state = make_initial_state(
         dataset_path=dataset_path,
         dataset_name=dataset_name,
         target_column=target_column,
+        requested_steps=requested_steps,
     )
 
     print(f"\n{'='*60}")
@@ -144,7 +199,7 @@ def run_pipeline(
     print(f"Session: {initial_state['metadata']['session_id']}")
     print(f"{'='*60}\n")
 
-    final_state = graph.invoke(initial_state)
+    final_state = graph.invoke(initial_state, {"recursion_limit": 50})
 
     print(f"\n{'='*60}")
     print("Pipeline complete.")
@@ -156,7 +211,6 @@ def run_pipeline(
 
 
 if __name__ == "__main__":
-    # Quick smoke test — runs with a fake path since Profiler is placeholder
     result = run_pipeline(
         dataset_path="data/raw/sample.csv",
         dataset_name="smoke_test",

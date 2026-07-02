@@ -22,6 +22,22 @@ import uuid
 
 
 def critic_node(state: AgentState) -> dict:
+    active_agent = state["metadata"]["current_active_agent"]
+    
+    # Pull the relevant decisions based on which agent just ran
+    if active_agent == "cleaner":
+        decisions_to_review = state["cleaner"]["decisions"]
+    elif active_agent == "encoder":
+        decisions_to_review = state["encoder"]["decisions"]
+    elif active_agent == "scaler":
+        decisions_to_review = state["scaler"]["decisions"]
+    elif active_agent == "imbalance_handler":
+        decisions_to_review = state["imbalance_handler"]["decisions"]
+    elif active_agent == "feature_selector":
+        decisions_to_review = state["feature_selector"]["decisions"]
+    else:
+        decisions_to_review = []
+        
     """
     Placeholder Critic node.
     Real version (Day 5) will:

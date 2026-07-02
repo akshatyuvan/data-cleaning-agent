@@ -3,23 +3,17 @@ agents/cleaner.py
 
 Day 1: Placeholder node.
 Day 3: Real implementation (LLM proposes actions, pandas applies them, decisions logged).
+
+UPDATED: now sets current_active_agent + pipeline_steps_run, required for
+the shared Critic + Orchestrator routing to work correctly.
 """
 
 from datetime import datetime, timezone
-from state.schema import AgentState, CleanerState, VizEvent
+from state.schema import AgentState, CleanerState, VizEvent, MetadataState
 import uuid
 
 
 def cleaner_node(state: AgentState) -> dict:
-    """
-    Placeholder Cleaning node.
-    Real version (Day 3) will:
-      - Iterate over state["profiler"]["issues"]
-      - For each issue, ask LLM: "Given this issue and context, what action do you propose?"
-      - Apply the action via pandas
-      - Log a CleaningDecision with full justification text
-      - Emit VizEvents (blue flash per cell acted on)
-    """
     print(f"[Cleaner] Round {state['cleaner']['current_round'] + 1}")
 
     event = VizEvent(
@@ -30,11 +24,18 @@ def cleaner_node(state: AgentState) -> dict:
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
+    # Mark this agent as active, and record that it has run (for orchestrator + critic)
+    updated_metadata = dict(state["metadata"])
+    updated_metadata["current_active_agent"] = "cleaner"
+    if "cleaner" not in updated_metadata["pipeline_steps_run"]:
+        updated_metadata["pipeline_steps_run"] = updated_metadata["pipeline_steps_run"] + ["cleaner"]
+
     return {
         "cleaner": CleanerState(
             current_round=state["cleaner"]["current_round"] + 1,
-            decisions=[],          # operator.add accumulates across rounds
+            decisions=[],
             dataset_snapshot_path=None,
         ),
+        "metadata": updated_metadata,
         "visualization_events": [event],
     }

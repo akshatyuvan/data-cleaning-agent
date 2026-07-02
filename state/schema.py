@@ -9,7 +9,7 @@ A flat dict looks tempting at first:
 But as your graph grows you get:
 - Name collisions:  which agent wrote "confidence"? The Critic or the Analyst?
 - Unclear ownership: can the Cleaning agent write to "profile_summary"? Should it?
-- No IDE help:      state["profiel_summary"] fails silently at runtime, not at type-check
+- No IDE help:      state["profile_summary"] fails silently at runtime, not at type-check
 
 Nested TypedDicts give you:
 - One sub-dict per agent → clear ownership, easy to reason about
@@ -124,6 +124,20 @@ class CriticVerdict(TypedDict):
     model_score_delta: Optional[float]  # quick downstream check (Day 5+)
     confidence: float               # 0.0-1.0, drives the arc in the UI
 
+class APIResponse(TypedDict):
+    """
+    Structured output returned by the FastAPI endpoint.
+    Built at the end of the pipeline from existing state.
+    No agent writes to this — it's assembled once at the end.
+    """
+    session_id: str
+    dataset_name: str
+    cleaned_data_path: str
+    agent_trace: list[dict]        # summary of every decision made
+    confidence_scores: dict        # per-column confidence after cleaning
+    insights: list[Insight]
+    total_rounds: int
+    errors: list[ErrorRecord]
 
 class CriticState(TypedDict):
     """
@@ -149,7 +163,66 @@ class AnalystState(TypedDict):
     run_complete: bool
     insights: list[Insight]
     analysis_summary: str
+    # NEW: RAG retrieved sources that grounded the analysis
+    retrieved_sources: list[dict]      # what was fetched from knowledge base
+    rag_collection: str                # which ChromaDB collection was queried
 
+class EncodingDecision(TypedDict):
+    decision_id: str
+    column: str
+    method: Literal["one_hot", "ordinal", "target_encoding", "no_action"]
+    justification: str
+    status: Literal["proposed", "applied", "rejected", "redo_requested"]
+    redo_count: int
+
+class EncodingState(TypedDict):
+    run_complete: bool
+    decisions: Annotated[list[EncodingDecision], operator.add]
+    dataset_snapshot_path: Optional[str]
+
+
+class ScalingDecision(TypedDict):
+    decision_id: str
+    column: str
+    method: Literal["standard", "minmax", "robust", "no_action"]
+    justification: str
+    status: Literal["proposed", "applied", "rejected", "redo_requested"]
+    redo_count: int
+
+class ScalingState(TypedDict):
+    run_complete: bool
+    decisions: Annotated[list[ScalingDecision], operator.add]
+    dataset_snapshot_path: Optional[str]
+
+
+class ImbalanceDecision(TypedDict):
+    decision_id: str
+    technique: Literal["smote", "smote_nc", "borderline_smote", "adasyn", "smote_tomek", "class_weights", "no_action"]
+    justification: str
+    class_distribution_before: dict[str, int]
+    class_distribution_after: dict[str, int]
+    status: Literal["proposed", "applied", "rejected", "redo_requested"]
+    redo_count: int
+
+class ImbalanceState(TypedDict):
+    run_complete: bool
+    user_opted_in: bool          # always check this before running
+    decisions: Annotated[list[ImbalanceDecision], operator.add]
+    dataset_snapshot_path: Optional[str]
+
+
+class FeatureSelectionDecision(TypedDict):
+    decision_id: str
+    column: str
+    action: Literal["keep", "drop_low_variance", "drop_correlated", "drop_low_mutual_info"]
+    justification: str
+    status: Literal["proposed", "applied", "rejected", "redo_requested"]
+    redo_count: int
+
+class FeatureSelectorState(TypedDict):
+    run_complete: bool
+    decisions: Annotated[list[FeatureSelectionDecision], operator.add]
+    dataset_snapshot_path: Optional[str]
 
 # ---------------------------------------------------------
 # TOP-LEVEL STATE  (what LangGraph sees)
@@ -174,6 +247,10 @@ class AgentState(TypedDict):
     # Per-agent namespaces
     profiler: ProfilerState
     cleaner: CleanerState
+    encoder: EncodingState           # NEW
+    scaler: ScalingState             # NEW
+    imbalance_handler: ImbalanceState  # NEW
+    feature_selector: FeatureSelectorState  # NEW
     critic: CriticState
     analyst: AnalystState
 
@@ -183,6 +260,19 @@ class AgentState(TypedDict):
 
     # Frontend event bus (visualization layer reads this)
     visualization_events: Annotated[list[VizEvent], operator.add]
+    api_response: Optional[APIResponse]   # NEW: structured output for FastAPI
+
+class RequestedSteps(TypedDict):
+    """
+    User's selection of which pipeline steps to run.
+    Defaults applied in make_initial_state() if not provided.
+    """
+    cleaning: bool
+    encoding: bool
+    scaling: bool
+    imbalance_handling: bool       # always defaults to False — opt-in only
+    feature_selection: bool
+    datetime_engineering: bool
 
 
 class InputState(TypedDict):
@@ -192,6 +282,7 @@ class InputState(TypedDict):
     dataset_path: str               # path to the raw messy CSV / parquet
     dataset_name: str               # human label for logs/UI
     target_column: Optional[str]    # for downstream eval (Day 9+), can be None
+    requested_steps: RequestedSteps
 
 
 class MetadataState(TypedDict):
@@ -203,6 +294,9 @@ class MetadataState(TypedDict):
     max_critic_rounds: int          # cap for the redo loop (default 3)
     llm_model: str                  # e.g. "gpt-4o-mini" or fine-tuned model path
     chroma_collection: str          # which ChromaDB collection to query
+    rag_collection: str             # NEW: Collection 2 (analyst RAG)
+    current_active_agent: Optional[str]   # NEW: which agent is running right now
+    pipeline_steps_run: list[str]          # NEW: actual execution order (for trace + dependency notes)
 
 
 class ErrorRecord(TypedDict):
@@ -228,7 +322,7 @@ class VizEvent(TypedDict):
       "verified"   -> green
     """
     event_id: str
-    agent: Literal["profiler", "cleaner", "critic", "analyst"]
+    agent: Literal["profiler", "cleaner", "critic", "analyst", "encoder", "scaler", "imbalance_handler", "feature_selector"]
     event_type: Literal[
         "cell_status_change",
         "critic_reasoning_chunk",   # streamed text for side panel
@@ -251,6 +345,7 @@ def make_initial_state(
     llm_model: str = "gpt-4o-mini",
     max_critic_rounds: int = 3,
     chroma_collection: str = "data_quality_patterns",
+    requested_steps: Optional[RequestedSteps] = None,
 ) -> AgentState:
     """
     Returns a fully-initialized AgentState with sensible defaults.
@@ -264,35 +359,71 @@ def make_initial_state(
     import uuid
     from datetime import datetime, timezone
 
+    # Default: everything on except imbalance handling (opt-in only)
+    if requested_steps is None:
+        requested_steps = RequestedSteps(
+            cleaning=True,
+            encoding=True,
+            scaling=True,
+            imbalance_handling=False,
+            feature_selection=True,
+            datetime_engineering=True,
+        )
+
+
     return AgentState(
         input=InputState(
             dataset_path=dataset_path,
             dataset_name=dataset_name,
             target_column=target_column,
+            requested_steps=requested_steps,
         ),
         profiler=ProfilerState(
-            run_complete=False,
-            row_count=0,
+            run_complete=False, 
+            row_count=0, 
             column_count=0,
-            issues=[],
-            profile_summary="",
+            issues=[], 
+            profile_summary="", 
             column_stats={},
         ),
         cleaner=CleanerState(
-            current_round=0,
-            decisions=[],
+            current_round=0, 
+            decisions=[], 
+            dataset_snapshot_path=None
+        ),
+        encoder=EncodingState(
+            run_complete=False, 
+            decisions=[], 
+            dataset_snapshot_path=None
+        ),
+        scaler=ScalingState(
+            run_complete=False, 
+            decisions=[], 
+            dataset_snapshot_path=None
+        ),
+        imbalance_handler=ImbalanceState(
+            run_complete=False,
+            user_opted_in=requested_steps["imbalance_handling"],
+            decisions=[], 
             dataset_snapshot_path=None,
         ),
+        feature_selector=FeatureSelectorState(
+            run_complete=False, 
+            decisions=[], 
+            dataset_snapshot_path=None
+        ),
         critic=CriticState(
-            verdicts=[],
-            current_verdict=None,
-            total_rounds=0,
-            max_rounds=max_critic_rounds,
+            verdicts=[], 
+            current_verdict=None, 
+            total_rounds=0, 
+            max_rounds=max_critic_rounds
         ),
         analyst=AnalystState(
-            run_complete=False,
-            insights=[],
+            run_complete=False, 
+            insights=[], 
             analysis_summary="",
+            retrieved_sources=[], 
+            rag_collection="data_science_knowledge_base",
         ),
         metadata=MetadataState(
             session_id=session_id or str(uuid.uuid4()),
@@ -300,7 +431,11 @@ def make_initial_state(
             max_critic_rounds=max_critic_rounds,
             llm_model=llm_model,
             chroma_collection=chroma_collection,
+            rag_collection="data_science_knowledge_base",
+            current_active_agent=None,
+            pipeline_steps_run=[],
         ),
         errors=[],
         visualization_events=[],
+        api_response=None,
     )
